@@ -38,6 +38,12 @@ import (
 	"github.com/elastic/beats/v7/libbeat/testing"
 )
 
+var (
+	errPayloadTooLarge = errors.New("the bulk payload is too large for the server. Consider to adjust `http.max_content_length` parameter in Elasticsearch or `bulk_max_size` in the beat. The batch has been dropped")
+
+	ErrTooOld = errors.New("Elasticsearch is too old. Please upgrade the instance. If you would like to connect to older instances set output.elasticsearch.allow_older_versions to true.")
+)
+
 // Client is an elasticsearch client.
 type Client struct {
 	conn eslegclient.Connection
@@ -84,6 +90,7 @@ func NewClient(
 
 	conn, err := eslegclient.NewConnection(eslegclient.ConnectionSettings{
 		URL:              s.URL,
+		Beatname:         s.Beatname,
 		Username:         s.Username,
 		Password:         s.Password,
 		APIKey:           s.APIKey,
@@ -145,6 +152,7 @@ func (client *Client) Clone() *Client {
 	// create install a template, we don't want these to be included in the clone.
 	connection := eslegclient.ConnectionSettings{
 		URL:               client.conn.URL,
+		Beatname:          client.conn.Beatname,
 		Kerberos:          client.conn.Kerberos,
 		Username:          client.conn.Username,
 		Password:          client.conn.Password,
@@ -178,9 +186,13 @@ func (client *Client) Clone() *Client {
 func (client *Client) Publish(ctx context.Context, batch publisher.Batch) error {
 	events := batch.Events()
 	rest, err := client.publishEvents(ctx, events)
-	if len(rest) == 0 {
+
+	switch {
+	case err == errPayloadTooLarge:
+		batch.Drop()
+	case len(rest) == 0:
 		batch.ACK()
-	} else {
+	default:
 		batch.RetryEvents(rest)
 	}
 	return err
@@ -218,7 +230,11 @@ func (client *Client) publishEvents(ctx context.Context, data []publisher.Event)
 	}
 
 	status, result, sendErr := client.conn.Bulk(ctx, "", "", nil, bulkItems)
+
 	if sendErr != nil {
+		if status == http.StatusRequestEntityTooLarge {
+			sendErr = errPayloadTooLarge
+		}
 		err := apm.CaptureError(ctx, fmt.Errorf("failed to perform any bulk index operations: %w", sendErr))
 		err.Send()
 		client.log.Error(err)

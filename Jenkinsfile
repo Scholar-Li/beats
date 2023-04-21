@@ -20,13 +20,15 @@ pipeline {
     PIPELINE_LOG_LEVEL = 'INFO'
     PYTEST_ADDOPTS = "${params.PYTEST_ADDOPTS}"
     RUNBLD_DISABLE_NOTIFICATIONS = 'true'
-    SLACK_CHANNEL = "#beats-build"
+    SLACK_CHANNEL = "#beats"
     SNAPSHOT = 'true'
-    TERRAFORM_VERSION = "0.12.30"
+    TERRAFORM_VERSION = "0.13.7"
     XPACK_MODULE_PATTERN = '^x-pack\\/[a-z0-9]+beat\\/module\\/([^\\/]+)\\/.*'
+    KIND_VERSION = 'v0.12.0'
+    K8S_VERSION = 'v1.23.4'
   }
   options {
-    timeout(time: 4, unit: 'HOURS')
+    timeout(time: 6, unit: 'HOURS')
     buildDiscarder(logRotator(numToKeepStr: '60', artifactNumToKeepStr: '20', daysToKeepStr: '30'))
     timestamps()
     ansiColor('xterm')
@@ -36,7 +38,7 @@ pipeline {
     rateLimitBuilds(throttle: [count: 60, durationName: 'hour', userBoost: true])
   }
   triggers {
-    issueCommentTrigger('(?i)(.*(?:jenkins\\W+)?run\\W+(?:the\\W+)?tests(?:\\W+please)?.*|^/test(?:\\W+.*)?$)')
+    issueCommentTrigger("${obltGitHubComments()}")
   }
   parameters {
     booleanParam(name: 'allCloudTests', defaultValue: false, description: 'Run all cloud integration tests.')
@@ -85,8 +87,8 @@ pipeline {
         GOFLAGS = '-mod=readonly'
       }
       steps {
-        stageStatusCache(id: 'Lint'){
-          withGithubNotify(context: "Lint") {
+        withGithubNotify(context: "Lint") {
+          stageStatusCache(id: 'Lint'){
             withBeatsEnv(archive: false, id: "lint") {
               dumpVariables()
               whenTrue(env.ONLY_DOCS == 'true') {
@@ -141,11 +143,9 @@ pipeline {
     stage('Packaging') {
       options { skipDefaultCheckout() }
       when {
-        // Always when running builds on branches/tags
         // On a PR basis, skip if changes are only related to docs.
         // Always when forcing the input parameter
         anyOf {
-          not { changeRequest() }                           // If no PR
           allOf {                                           // If PR and no docs changes
             expression { return env.ONLY_DOCS == "false" }
             changeRequest()
@@ -187,7 +187,7 @@ VERSION=${env.VERSION}-SNAPSHOT""")
       // Required to enable the flaky test reporting with GitHub. Workspace exists since the post/always runs earlier
       dir("${BASE_DIR}"){
         notifyBuildResult(prComment: true,
-                          slackComment: true, slackNotify: (isBranch() || isTag()),
+                          slackComment: true,
                           analyzeFlakey: !isTag(), jobName: getFlakyJobName(withBranch: getFlakyBranch()))
       }
     }
@@ -203,8 +203,22 @@ def runLinting() {
     }
   }
   mapParallelTasks['default'] = { cmd(label: 'make check-default', script: 'make check-default') }
-
+  mapParallelTasks['pre-commit'] = runPreCommit()
   parallel(mapParallelTasks)
+}
+
+def runPreCommit() {
+  return {
+    withNode(labels: 'ubuntu-18 && immutable', forceWorkspace: true){
+      withGithubNotify(context: 'Check pre-commit', tab: 'tests') {
+        deleteDir()
+        unstashV2(name: 'source', bucket: "${JOB_GCS_BUCKET}", credentialsId: "${JOB_GCS_CREDENTIALS}")
+        dir("${BASE_DIR}"){
+          preCommit(commit: "${GIT_BASE_COMMIT}", junit: true)
+        }
+      }
+    }
+  }
 }
 
 def runBuildAndTest(Map args = [:]) {
@@ -230,7 +244,7 @@ def runBuildAndTest(Map args = [:]) {
 
 
 /**
-* There are only two supported branches, master and 7.x
+* Only supported the main branch
 */
 def getFlakyBranch() {
   if(isPR()) {
@@ -241,17 +255,10 @@ def getFlakyBranch() {
 }
 
 /**
-* There are only two supported branches, master and 7.x
+* Only supported the main branch
 */
 def getBranchIndice(String compare) {
-  if (compare?.equals('master') || compare.equals('7.x')) {
-    return compare
-  } else {
-    if (compare.startsWith('7.')) {
-      return '7.x'
-    }
-  }
-  return 'master'
+  return 'main'
 }
 
 /**
@@ -277,14 +284,16 @@ def generateStages(Map args = [:]) {
 }
 
 def cloud(Map args = [:]) {
-  withNode(labels: args.label, forceWorkspace: true){
-    startCloudTestEnv(name: args.directory, dirs: args.dirs)
-  }
-  withCloudTestEnv() {
-    try {
-      target(context: args.context, command: args.command, directory: args.directory, label: args.label, withModule: args.withModule, isMage: true, id: args.id)
-    } finally {
-      terraformCleanup(name: args.directory, dir: args.directory)
+  withGithubNotify(context: args.context) {
+    withNode(labels: args.label, forceWorkspace: true){
+      startCloudTestEnv(name: args.directory, dirs: args.dirs, withAWS: args.withAWS)
+    }
+    withCloudTestEnv(args) {
+      try {
+        target(context: args.context, command: args.command, directory: args.directory, label: args.label, withModule: args.withModule, isMage: true, id: args.id)
+      } finally {
+        terraformCleanup(name: args.directory, dir: args.directory, withAWS: args.withAWS)
+      }
     }
   }
 }
@@ -294,35 +303,52 @@ def k8sTest(Map args = [:]) {
   versions.each{ v ->
     withNode(labels: args.label, forceWorkspace: true){
       stage("${args.context} ${v}"){
-        withEnv(["K8S_VERSION=${v}", "KIND_VERSION=v0.11.1", "KUBECONFIG=${env.WORKSPACE}/kubecfg"]){
+        withEnv(["K8S_VERSION=${v}"]){
           withGithubNotify(context: "${args.context} ${v}") {
             withBeatsEnv(archive: false, withModule: false) {
-              retryWithSleep(retries: 2, seconds: 5, backoff: true){ sh(label: "Install kind", script: ".ci/scripts/install-kind.sh") }
-              retryWithSleep(retries: 2, seconds: 5, backoff: true){ sh(label: "Install kubectl", script: ".ci/scripts/install-kubectl.sh") }
-              try {
-                // Add some environmental resilience when setup does not work the very first time.
-                def i = 0
-                retryWithSleep(retries: 3, seconds: 5, backoff: true){
-                  try {
-                    sh(label: "Setup kind", script: ".ci/scripts/kind-setup.sh")
-                  } catch(err) {
-                    i++
-                    sh(label: 'Delete cluster', script: 'kind delete cluster')
-                    if (i > 2) {
-                      error("Setup kind failed with error '${err.toString()}'")
-                    }
-                  }
-                }
+              withTools(k8s: true) {
                 sh(label: "Integration tests", script: "MODULE=kubernetes make -C metricbeat integration-tests")
                 sh(label: "Deploy to kubernetes",script: "make -C deploy/kubernetes test")
-              } finally {
-                sh(label: 'Delete cluster', script: 'kind delete cluster')
               }
             }
           }
         }
       }
     }
+  }
+}
+
+/**
+* It relies on:
+* - KIND_VERSION which it's defined in the top-level environment section.
+* - K8S_VERSION which it's defined by default in the top-level environment section or set in the withEnv.
+*/
+def withTools(Map args = [:], Closure body) {
+  if (args.get('k8s', false)) {
+    withEnv(["KUBECONFIG=${env.WORKSPACE}/kubecfg"]){
+      retryWithSleep(retries: 2, seconds: 5, backoff: true){ sh(label: "Install kind", script: ".ci/scripts/install-kind.sh") }
+      retryWithSleep(retries: 2, seconds: 5, backoff: true){ sh(label: "Install kubectl", script: ".ci/scripts/install-kubectl.sh") }
+      try {
+        // Add some environmental resilience when setup does not work the very first time.
+        def i = 0
+        retryWithSleep(retries: 3, seconds: 5, backoff: true){
+          try {
+            sh(label: "Setup kind", script: ".ci/scripts/kind-setup.sh")
+          } catch(err) {
+            i++
+            sh(label: 'Delete cluster', script: 'kind delete cluster')
+            if (i > 2) {
+              error("Setup kind failed with error '${err.toString()}'")
+            }
+          }
+        }
+        body()
+      } finally {
+        sh(label: 'Delete cluster', script: 'kind delete cluster')
+      }
+    }
+  } else {
+    body()
   }
 }
 
@@ -417,8 +443,6 @@ def pushCIDockerImages(Map args = [:]) {
       tagAndPush(beatName: 'filebeat', arch: arch)
     } else if (beatsFolder.endsWith('heartbeat')) {
       tagAndPush(beatName: 'heartbeat', arch: arch)
-    } else if ("${beatsFolder}" == "journalbeat"){
-      tagAndPush(beatName: 'journalbeat', arch: arch)
     } else if (beatsFolder.endsWith('metricbeat')) {
       tagAndPush(beatName: 'metricbeat', arch: arch)
     } else if ("${beatsFolder}" == "packetbeat"){
@@ -456,9 +480,17 @@ def tagAndPush(Map args = [:]) {
   }
   // supported image flavours
   def variants = ["", "-oss", "-ubi8"]
+
+  if(beatName == 'elastic-agent'){
+    variants.add("-complete")
+    variants.add("-cloud")
+  }
+
   variants.each { variant ->
+    // cloud docker images are stored in the private docker namespace.
+    def sourceNamespace = variant.equals('-cloud') ? 'beats-ci' : 'beats'
     tags.each { tag ->
-      doTagAndPush(beatName: beatName, variant: variant, sourceTag: libbetaVer, targetTag: "${tag}-${arch}")
+      doTagAndPush(beatName: beatName, variant: variant, sourceTag: libbetaVer, targetTag: "${tag}-${arch}", sourceNamespace: sourceNamespace)
     }
   }
 }
@@ -474,7 +506,8 @@ def doTagAndPush(Map args = [:]) {
   def variant = args.variant
   def sourceTag = args.sourceTag
   def targetTag = args.targetTag
-  def sourceName = "${DOCKER_REGISTRY}/beats/${beatName}${variant}:${sourceTag}"
+  def sourceNamespace = args.sourceNamespace
+  def sourceName = "${DOCKER_REGISTRY}/${sourceNamespace}/${beatName}${variant}:${sourceTag}"
   def targetName = "${DOCKER_REGISTRY}/observability-ci/${beatName}${variant}:${targetTag}"
 
   def iterations = 0
@@ -504,17 +537,36 @@ def getBeatsName(baseDir) {
 }
 
 /**
+* This method runs the end 2 end testing
+*/
+def e2e(Map args = [:]) {
+  if (!args.e2e?.get('enabled', false)) { return }
+  // Skip running the tests on branches or tags if configured.
+  if (!isPR() && args.e2e?.get('when', false)) {
+    if (isBranch() && !args.e2e.when.get('branches', true)) { return }
+    if (isTag() && !args.e2e.when.get('tags', true)) { return }
+  }
+  if (args.e2e.get('entrypoint', '')?.trim()) {
+    e2e_with_entrypoint(args)
+  } else {
+    runE2E(testMatrixFile: args.e2e?.get('testMatrixFile', ''),
+           beatVersion: "${env.VERSION}-SNAPSHOT",
+           gitHubCheckName: "e2e-${args.context}",
+           gitHubCheckRepo: env.REPO,
+           gitHubCheckSha1: env.GIT_BASE_COMMIT)
+  }
+}
+
+/**
 * This method runs the end 2 end testing in the same worker where the packages have been
 * generated, this should help to speed up the things
 */
-def e2e(Map args = [:]) {
-  def enabled = args.e2e?.get('enabled', false)
+def e2e_with_entrypoint(Map args = [:]) {
   def entrypoint = args.e2e?.get('entrypoint')
   def dockerLogFile = "docker_logs_${entrypoint}.log"
-  if (!enabled) { return }
   dir("${env.WORKSPACE}/src/github.com/elastic/e2e-testing") {
     // TBC with the target branch if running on a PR basis.
-    git(branch: 'master', credentialsId: '2a9602aa-ab9f-4e52-baf3-b71ca88469c7-UserAndToken', url: 'https://github.com/elastic/e2e-testing.git')
+    git(branch: 'main', credentialsId: '2a9602aa-ab9f-4e52-baf3-b71ca88469c7-UserAndToken', url: 'https://github.com/elastic/e2e-testing.git')
     if(isDockerInstalled()) {
       dockerLogin(secret: "${DOCKER_ELASTIC_SECRET}", registry: "${DOCKER_REGISTRY}")
     }
@@ -525,14 +577,12 @@ def e2e(Map args = [:]) {
               "LOG_LEVEL=TRACE"]) {
       def status = 0
       filebeat(output: dockerLogFile){
-        status = sh(script: ".ci/scripts/${entrypoint}",
-                    label: "Run functional tests ${entrypoint}",
-                    returnStatus: true)
-      }
-      junit(allowEmptyResults: true, keepLongStdio: true, testResults: "outputs/TEST-*.xml")
-      archiveArtifacts allowEmptyArchive: true, artifacts: "outputs/TEST-*.xml"
-      if (status != 0) {
-        error("ERROR: functional tests for ${args?.directory?.trim()} has failed. See the test report and ${dockerLogFile}.")
+        try {
+          sh(script: ".ci/scripts/${entrypoint}", label: "Run functional tests ${entrypoint}")
+        } finally {
+          junit(allowEmptyResults: true, keepLongStdio: true, testResults: "outputs/TEST-*.xml")
+          archiveArtifacts allowEmptyArchive: true, artifacts: "outputs/TEST-*.xml"
+        }
       }
     }
   }
@@ -551,37 +601,36 @@ def target(Map args = [:]) {
   def isMage = args.get('isMage', false)
   def isE2E = args.e2e?.get('enabled', false)
   def isPackaging = args.get('package', false)
+  def installK8s = args.get('installK8s', false)
   def dockerArch = args.get('dockerArch', 'amd64')
   def enableRetry = args.get('enableRetry', false)
   withNode(labels: args.label, forceWorkspace: true){
     withGithubNotify(context: "${context}") {
       withBeatsEnv(archive: true, withModule: withModule, directory: directory, id: args.id) {
         dumpVariables()
-        // make commands use -C <folder> while mage commands require the dir(folder)
-        // let's support this scenario with the location variable.
-        dir(isMage ? directory : '') {
-          if (enableRetry) {
-            // Retry the same command to bypass any kind of flakiness.
-            // Downside: genuine failures will be repeated.
-            retry(3) {
+        withTools(k8s: installK8s) {
+          // make commands use -C <folder> while mage commands require the dir(folder)
+          // let's support this scenario with the location variable.
+          dir(isMage ? directory : '') {
+            if (enableRetry) {
+              // Retry the same command to bypass any kind of flakiness.
+              // Downside: genuine failures will be repeated.
+              retry(3) {
+                cmd(label: "${args.id?.trim() ? args.id : env.STAGE_NAME} - ${command}", script: "${command}")
+              }
+            } else {
               cmd(label: "${args.id?.trim() ? args.id : env.STAGE_NAME} - ${command}", script: "${command}")
             }
-          } else {
-            cmd(label: "${args.id?.trim() ? args.id : env.STAGE_NAME} - ${command}", script: "${command}")
           }
         }
-        // TODO:
-        // Packaging should happen only after the e2e?
+        // Publish packages should happen always to easily consume those artifacts if the
+        // e2e were triggered and failed.
         if (isPackaging) {
           publishPackages("${directory}")
+          pushCIDockerImages(beatsFolder: "${directory}", arch: dockerArch)
         }
         if(isE2E) {
           e2e(args)
-        }
-        // TODO:
-        // push docker images should happen only after the e2e?
-        if (isPackaging) {
-          pushCIDockerImages(beatsFolder: "${directory}", arch: dockerArch)
         }
       }
     }
@@ -600,7 +649,7 @@ def withBeatsEnv(Map args = [:], Closure body) {
 
   if(isUnix()) {
     gox_flags = (isArm() && is64arm()) ? '-arch arm' : '-arch amd64'
-    path = "${env.WORKSPACE}/bin:${env.PATH}"
+    path = "${env.WORKSPACE}/bin:${env.PATH}:/usr/local/bin"
     magefile = "${WORKSPACE}/.magefile"
     pythonEnv = "${WORKSPACE}/python-env"
     testResults = '**/build/TEST*.xml'
@@ -668,6 +717,7 @@ def withBeatsEnv(Map args = [:], Closure body) {
           error("Error '${err.toString()}'")
         } finally {
           if (archive) {
+            archiveArtifacts(allowEmptyArchive: true, artifacts: "${directory}/build/system-tests/docker-logs/TEST-docker-compose-*.log")
             archiveTestOutput(directory: directory, testResults: testResults, artifacts: artifacts, id: args.id, upload: upload)
           }
           tearDown()
@@ -793,18 +843,22 @@ def archiveTestOutput(Map args = [:]) {
       catchError(buildResult: 'SUCCESS', message: 'Failed to archive the build test results', stageResult: 'SUCCESS') {
         withMageEnv(version: "${env.GO_VERSION}"){
           dir(directory){
-            cmd(label: "Archive system tests files", script: 'mage packageSystemTests')
+            cmd(label: "Archive system tests files", script: 'mage packageSystemTests', returnStatus: true)
           }
         }
+
         def fileName = 'build/system-tests-*.tar.gz' // see dev-tools/mage/target/common/package.go#PackageSystemTests method
-        dir("${BASE_DIR}"){
-          cmd(label: "List files to upload", script: "ls -l ${BASE_DIR}/${fileName}")
+        def files = findFiles(glob: "${fileName}")
+
+        if (files?.length > 0) {
           googleStorageUploadExt(
             bucket: "gs://${JOB_GCS_BUCKET}/${env.JOB_NAME}-${env.BUILD_ID}",
             credentialsId: "${JOB_GCS_EXT_CREDENTIALS}",
-            pattern: "${BASE_DIR}/${fileName}",
+            pattern: "${fileName}",
             sharedPublicly: true
           )
+        } else {
+          log(level: 'WARN', text: "There are no system-tests files to upload Google Storage}")
         }
       }
     }
@@ -828,12 +882,15 @@ def tarAndUploadArtifacts(Map args = [:]) {
 * This method executes a closure with credentials for cloud test
 * environments.
 */
-def withCloudTestEnv(Closure body) {
+def withCloudTestEnv(Map args = [:], Closure body) {
   def maskedVars = []
   def testTags = "${env.TEST_TAGS}"
 
-  // AWS
-  if (params.allCloudTests || params.awsCloudTests) {
+  // Allow AWS credentials when the build was configured to do so with:
+  //   - the cloudtests build parameters
+  //   - the aws github label
+  //   - forced with the cloud argument aws github label
+  if (params.allCloudTests || params.awsCloudTests || matchesPrLabel(label: 'aws') || args.get('withAWS', false)) {
     testTags = "${testTags},aws"
     def aws = getVaultSecret(secret: "${AWS_ACCOUNT_SECRET}").data
     if (!aws.containsKey('access_key')) {
@@ -847,6 +904,7 @@ def withCloudTestEnv(Closure body) {
       [var: "AWS_ACCESS_KEY_ID", password: aws.access_key],
       [var: "AWS_SECRET_ACCESS_KEY", password: aws.secret_key],
     ])
+    log(level: 'INFO', text: 'withCloudTestEnv: it has been configured to run in AWS.')
   }
 
   withEnv([
@@ -872,7 +930,7 @@ def startCloudTestEnv(Map args = [:]) {
   String name = normalise(args.name)
   def dirs = args.get('dirs',[])
   stage("${name}-prepare-cloud-env"){
-    withCloudTestEnv() {
+    withCloudTestEnv(args) {
       withBeatsEnv(archive: false, withModule: false) {
         try {
           dirs?.each { folder ->
@@ -885,6 +943,7 @@ def startCloudTestEnv(Map args = [:]) {
             // If it failed then cleanup without failing the build
             sh(label: 'Terraform Cleanup', script: ".ci/scripts/terraform-cleanup.sh ${folder}", returnStatus: true)
           }
+          error('startCloudTestEnv: terraform apply failed.')
         } finally {
           // Archive terraform states in case manual cleanup is needed.
           archiveArtifacts(allowEmptyArchive: true, artifacts: '**/terraform.tfstate')
@@ -914,7 +973,7 @@ def terraformCleanup(Map args = [:]) {
   String name = normalise(args.name)
   String directory = args.dir
   stage("${name}-tear-down-cloud-env"){
-    withCloudTestEnv() {
+    withCloudTestEnv(args) {
       withBeatsEnv(archive: false, withModule: false) {
         unstash("terraform-${name}")
         retryWithSleep(retries: 2, seconds: 5, backoff: true) {
@@ -1039,6 +1098,8 @@ class RunCommand extends co.elastic.beats.BeatsFunction {
   public run(Map args = [:]){
     steps.stageStatusCache(args){
       def withModule = args.content.get('withModule', false)
+      def installK8s = args.content.get('installK8s', false)
+      def withAWS = args.content.get('withAWS', false)
       //
       // What's the retry policy for fighting the flakiness:
       //   1) Lint/Packaging/Cloud/k8sTest stages don't retry, since their failures are normally legitim
@@ -1055,6 +1116,7 @@ class RunCommand extends co.elastic.beats.BeatsFunction {
                      directory: args.project,
                      label: args.label,
                      withModule: withModule,
+                     installK8s: installK8s,
                      isMage: false,
                      id: args.id,
                      enableRetry: enableRetry)
@@ -1064,6 +1126,7 @@ class RunCommand extends co.elastic.beats.BeatsFunction {
                      command: args.content.mage,
                      directory: args.project,
                      label: args.label,
+                     installK8s: installK8s,
                      withModule: withModule,
                      isMage: true,
                      id: args.id,
@@ -1097,7 +1160,7 @@ class RunCommand extends co.elastic.beats.BeatsFunction {
         steps.k8sTest(context: args.context, versions: args.content.k8sTest.split(','), label: args.label, id: args.id)
       }
       if(args?.content?.containsKey('cloud')) {
-        steps.cloud(context: args.context, command: args.content.cloud, directory: args.project, label: args.label, withModule: withModule, dirs: args.content.dirs, id: args.id)
+        steps.cloud(context: args.context, command: args.content.cloud, directory: args.project, label: args.label, withModule: withModule, dirs: args.content.dirs, id: args.id, withAWS: withAWS)
       }
     }
   }

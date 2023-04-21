@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// +build darwin freebsd linux windows
+//go:build darwin || freebsd || linux || windows || aix
+// +build darwin freebsd linux windows aix
 
 package process
 
@@ -25,17 +26,25 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
+	"github.com/elastic/beats/v7/libbeat/logp"
+	"github.com/elastic/beats/v7/libbeat/metric/system/process"
 	mbtest "github.com/elastic/beats/v7/metricbeat/mb/testing"
+	_ "github.com/elastic/beats/v7/metricbeat/module/system"
 )
 
 func TestFetch(t *testing.T) {
+	logp.DevelopmentSetup()
 	f := mbtest.NewReportingMetricSetV2Error(t, getConfig())
 	events, errs := mbtest.ReportingFetchV2Error(f)
-
 	assert.Empty(t, errs)
-	if !assert.NotEmpty(t, events) {
-		t.FailNow()
-	}
+	assert.NotEmpty(t, events)
+
+	time.Sleep(2 * time.Second)
+
+	events, errs = mbtest.ReportingFetchV2Error(f)
+	assert.Empty(t, errs)
+	assert.NotEmpty(t, events)
+
 	t.Logf("%s/%s event: %+v", f.Module().Name(), f.Name(),
 		events[0].BeatEvent("system", "process").Fields.StringToPrint())
 }
@@ -55,8 +64,12 @@ func TestData(t *testing.T) {
 
 func getConfig() map[string]interface{} {
 	return map[string]interface{}{
-		"module":     "system",
-		"metricsets": []string{"process"},
-		//"processes":  []string{".*metricbeat.*"}, // in case we want a prettier looking example for data.json
+		"module":                        "system",
+		"metricsets":                    []string{"process"},
+		"processes":                     []string{".*"}, // in case we want a prettier looking example for data.json
+		"process.cgroups.enabled":       true,
+		"process.include_cpu_ticks":     true,
+		"process.cmdline.cache.enabled": true,
+		"process.include_top_n":         process.IncludeTopConfig{Enabled: true, ByCPU: 5},
 	}
 }

@@ -2,6 +2,7 @@
 // or more contributor license agreements. Licensed under the Elastic License;
 // you may not use this file except in compliance with the Elastic License.
 
+//go:build windows
 // +build windows
 
 package install
@@ -33,4 +34,10 @@ func postInstall() error {
 	}
 
 	return nil
+}
+
+// checkPackageInstall is used for unix based systems to see if the Elastic-Agent was installed through a package manager.
+// returns false
+func checkPackageInstall() bool {
+	return false
 }

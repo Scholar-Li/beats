@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//go:build (linux || darwin || windows) && !integration
 // +build linux darwin windows
 // +build !integration
 
@@ -34,25 +35,31 @@ import (
 	"github.com/elastic/beats/v7/libbeat/common/docker"
 	"github.com/elastic/beats/v7/libbeat/logp"
 	"github.com/elastic/beats/v7/libbeat/metric/system/cgroup"
+	"github.com/elastic/beats/v7/libbeat/metric/system/resolve"
 )
 
 func init() {
 	// Stub out the procfs.
-	processCgroupPaths = func(_ string, pid int) (map[string]cgroup.ControllerPath, error) {
+	processCgroupPaths = func(_ resolve.Resolver, pid int) (cgroup.PathList, error) {
+
 		switch pid {
 		case 1000:
-			return map[string]cgroup.ControllerPath{
-				"cpu": {ControllerPath: "/docker/8c147fdfab5a2608fe513d10294bf77cb502a231da9725093a155bd25cd1f14b", IsV2: false},
+			return cgroup.PathList{
+				V1: map[string]cgroup.ControllerPath{
+					"cpu": {ControllerPath: "/docker/8c147fdfab5a2608fe513d10294bf77cb502a231da9725093a155bd25cd1f14b", IsV2: false},
+				},
 			}, nil
 		case 2000:
-			return map[string]cgroup.ControllerPath{
-				"memory": {ControllerPath: "/user.slice", IsV2: false},
+			return cgroup.PathList{
+				V1: map[string]cgroup.ControllerPath{
+					"memory": {ControllerPath: "/user.slice", IsV2: false},
+				},
 			}, nil
 		case 3000:
 			// Parser error (hopefully this never happens).
-			return nil, fmt.Errorf("cgroup parse failure")
+			return cgroup.PathList{}, fmt.Errorf("cgroup parse failure")
 		default:
-			return nil, os.ErrNotExist
+			return cgroup.PathList{}, os.ErrNotExist
 		}
 	}
 }
@@ -334,7 +341,7 @@ func TestMatchPIDs(t *testing.T) {
 	t.Run("pid is not containerized", func(t *testing.T) {
 		input := common.MapStr{}
 		input.Put("process.pid", 2000)
-		input.Put("process.ppid", 1000)
+		input.Put("process.parent.pid", 1000)
 
 		expected := common.MapStr{}
 		expected.DeepUpdate(input)
@@ -372,7 +379,7 @@ func TestMatchPIDs(t *testing.T) {
 	t.Run("pid exited and ppid is containerized", func(t *testing.T) {
 		fields := common.MapStr{}
 		fields.Put("process.pid", 9999)
-		fields.Put("process.ppid", 1000)
+		fields.Put("process.parent.pid", 1000)
 
 		expected := common.MapStr{}
 		expected.DeepUpdate(dockerMetadata)

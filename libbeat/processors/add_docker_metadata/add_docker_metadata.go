@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//go:build linux || darwin || windows
 // +build linux darwin windows
 
 package add_docker_metadata
@@ -34,6 +35,7 @@ import (
 	"github.com/elastic/beats/v7/libbeat/common/safemapstr"
 	"github.com/elastic/beats/v7/libbeat/logp"
 	"github.com/elastic/beats/v7/libbeat/metric/system/cgroup"
+	"github.com/elastic/beats/v7/libbeat/metric/system/resolve"
 	"github.com/elastic/beats/v7/libbeat/processors"
 	"github.com/elastic/beats/v7/libbeat/processors/actions"
 )
@@ -58,11 +60,11 @@ type addDockerMetadata struct {
 	fields          []string
 	sourceProcessor processors.Processor
 
-	pidFields       []string      // Field names that contain PIDs.
-	cgroups         *common.Cache // Cache of PID (int) to cgropus (map[string]string).
-	hostFS          string        // Directory where /proc is found
-	dedot           bool          // If set to true, replace dots in labels with `_`.
-	dockerAvailable bool          // If Docker exists in env, then it is set to true
+	pidFields       []string         // Field names that contain PIDs.
+	cgroups         *common.Cache    // Cache of PID (int) to cgropus (map[string]string).
+	hostFS          resolve.Resolver // Directory where /proc is found
+	dedot           bool             // If set to true, replace dots in labels with `_`.
+	dockerAvailable bool             // If Docker exists in env, then it is set to true
 }
 
 const selector = "add_docker_metadata"
@@ -113,7 +115,7 @@ func buildDockerMetadataProcessor(log *logp.Logger, cfg *common.Config, watcherC
 		fields:          config.Fields,
 		sourceProcessor: sourceProcessor,
 		pidFields:       config.MatchPIDs,
-		hostFS:          config.HostFS,
+		hostFS:          resolve.NewTestResolver(config.HostFS),
 		dedot:           config.DeDot,
 		dockerAvailable: dockerAvailable,
 	}, nil
@@ -235,7 +237,7 @@ func (d *addDockerMetadata) String() string {
 // lookupContainerIDByPID finds the container ID based on PID fields contained
 // in the event.
 func (d *addDockerMetadata) lookupContainerIDByPID(event *beat.Event) (string, error) {
-	var cgroups map[string]cgroup.ControllerPath
+	var cgroups cgroup.PathList
 	for _, field := range d.pidFields {
 		v, err := event.GetValue(field)
 		if err != nil {
@@ -264,11 +266,11 @@ func (d *addDockerMetadata) lookupContainerIDByPID(event *beat.Event) (string, e
 
 // getProcessCgroups returns a mapping of cgroup subsystem name to path. It
 // returns an error if it failed to retrieve the cgroup info.
-func (d *addDockerMetadata) getProcessCgroups(pid int) (map[string]cgroup.ControllerPath, error) {
+func (d *addDockerMetadata) getProcessCgroups(pid int) (cgroup.PathList, error) {
 	// Initialize at time of first use.
 	lazyCgroupCacheInit(d)
 
-	cgroups, ok := d.cgroups.Get(pid).(map[string]cgroup.ControllerPath)
+	cgroups, ok := d.cgroups.Get(pid).(cgroup.PathList)
 	if ok {
 		d.log.Debugf("Using cached cgroups for pid=%v", pid)
 		return cgroups, nil
@@ -276,7 +278,7 @@ func (d *addDockerMetadata) getProcessCgroups(pid int) (map[string]cgroup.Contro
 
 	cgroups, err := processCgroupPaths(d.hostFS, pid)
 	if err != nil {
-		return nil, errors.Wrapf(err, "failed to read cgroups for pid=%v", pid)
+		return cgroups, errors.Wrapf(err, "failed to read cgroups for pid=%v", pid)
 	}
 
 	d.cgroups.Put(pid, cgroups)
@@ -287,8 +289,8 @@ func (d *addDockerMetadata) getProcessCgroups(pid int) (map[string]cgroup.Contro
 // of them are associated with Docker. For cgroups V1, Docker uses /docker/<CID> when
 // naming cgroups and we use this to determine the container ID. For V2,
 // it's part of a more complex string.
-func getContainerIDFromCgroups(cgroups map[string]cgroup.ControllerPath) (string, error) {
-	for _, path := range cgroups {
+func getContainerIDFromCgroups(cgroups cgroup.PathList) (string, error) {
+	for _, path := range cgroups.Flatten() {
 		re := regexp.MustCompile(`[\w]{64}`)
 		rs := re.FindStringSubmatch(path.ControllerPath)
 		if rs != nil {

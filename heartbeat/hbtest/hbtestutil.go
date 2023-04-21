@@ -83,6 +83,18 @@ func SizedResponseHandler(bytes int) http.HandlerFunc {
 	)
 }
 
+func CustomResponseHandler(body []byte, status int, extraHeaders map[string]string) http.HandlerFunc {
+	return http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+			for key, val := range extraHeaders {
+				w.Header().Add(key, val)
+			}
+			w.WriteHeader(status)
+			w.Write(body)
+		},
+	)
+}
+
 // RedirectHandler redirects the paths at the keys in the redirectingPaths map to the locations in their values.
 // For paths not in the redirectingPaths map it returns a 200 response with the given body.
 func RedirectHandler(redirectingPaths map[string]string, body string) http.HandlerFunc {

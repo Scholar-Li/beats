@@ -13,12 +13,13 @@ import (
 
 // FleetServerConfig is the configuration written so Elastic Agent can run Fleet Server.
 type FleetServerConfig struct {
-	Bootstrap bool                     `config:"bootstrap" yaml:"bootstrap,omitempty"`
-	Policy    *FleetServerPolicyConfig `config:"policy" yaml:"policy,omitempty"`
-	Output    FleetServerOutputConfig  `config:"output" yaml:"output,omitempty"`
-	Host      string                   `config:"host" yaml:"host,omitempty"`
-	Port      uint16                   `config:"port" yaml:"port,omitempty"`
-	TLS       *tlscommon.Config        `config:"ssl" yaml:"ssl,omitempty"`
+	Bootstrap    bool                     `config:"bootstrap" yaml:"bootstrap,omitempty"`
+	Policy       *FleetServerPolicyConfig `config:"policy" yaml:"policy,omitempty"`
+	Output       FleetServerOutputConfig  `config:"output" yaml:"output,omitempty"`
+	Host         string                   `config:"host" yaml:"host,omitempty"`
+	Port         uint16                   `config:"port" yaml:"port,omitempty"`
+	InternalPort uint16                   `config:"internal_port" yaml:"internal_port,omitempty"`
+	TLS          *tlscommon.Config        `config:"ssl" yaml:"ssl,omitempty"`
 }
 
 // FleetServerPolicyConfig is the configuration for the policy Fleet Server should run on.
@@ -33,21 +34,19 @@ type FleetServerOutputConfig struct {
 
 // Elasticsearch is the configuration for elasticsearch.
 type Elasticsearch struct {
-	Protocol      string            `config:"protocol" yaml:"protocol"`
-	Hosts         []string          `config:"hosts" yaml:"hosts"`
-	Path          string            `config:"path" yaml:"path,omitempty"`
-	Username      string            `config:"username" yaml:"username,omitempty"`
-	Password      string            `config:"password" yaml:"password,omitempty"`
-	ServiceToken  string            `config:"service_token" yaml:"service_token,omitempty"`
-	TLS           *tlscommon.Config `config:"ssl" yaml:"ssl,omitempty"`
-	Headers       map[string]string `config:"headers" yaml:"headers,omitempty"`
-	ProxyURL      string            `config:"proxy_url" yaml:"proxy_url,omitempty"`
-	ProxyDisabled bool              `config:"proxy_disabled" yaml:"proxy_disabled"`
-	ProxyHeaders  map[string]string `config:"proxy_headers" yaml:"proxy_headers"`
+	Protocol     string            `config:"protocol" yaml:"protocol"`
+	Hosts        []string          `config:"hosts" yaml:"hosts"`
+	Path         string            `config:"path" yaml:"path,omitempty"`
+	ServiceToken string            `config:"service_token" yaml:"service_token,omitempty"`
+	TLS          *tlscommon.Config `config:"ssl" yaml:"ssl,omitempty"`
+	Headers      map[string]string `config:"headers" yaml:"headers,omitempty"`
+	ProxyURL     string            `config:"proxy_url" yaml:"proxy_url,omitempty"`
+	ProxyDisable bool              `config:"proxy_disable" yaml:"proxy_disable"`
+	ProxyHeaders map[string]string `config:"proxy_headers" yaml:"proxy_headers"`
 }
 
 // ElasticsearchFromConnStr returns an Elasticsearch configuration from the connection string.
-func ElasticsearchFromConnStr(conn string, serviceToken string) (Elasticsearch, error) {
+func ElasticsearchFromConnStr(conn string, serviceToken string, insecure bool) (Elasticsearch, error) {
 	u, err := url.Parse(conn)
 	if err != nil {
 		return Elasticsearch{}, err
@@ -64,18 +63,14 @@ func ElasticsearchFromConnStr(conn string, serviceToken string) (Elasticsearch, 
 		Path:     u.Path,
 		TLS:      nil,
 	}
-	if serviceToken != "" {
-		cfg.ServiceToken = serviceToken
-		return cfg, nil
+	if insecure {
+		cfg.TLS = &tlscommon.Config{
+			VerificationMode: tlscommon.VerifyNone,
+		}
 	}
-	if u.User == nil || u.User.Username() == "" {
-		return Elasticsearch{}, errors.New("invalid connection string: must include a username unless a service token is provided")
+	if serviceToken == "" {
+		return Elasticsearch{}, errors.New("invalid connection string: must include a service token")
 	}
-	password, ok := u.User.Password()
-	if !ok {
-		return Elasticsearch{}, errors.New("invalid connection string: must include a password unless a service token is provided")
-	}
-	cfg.Username = u.User.Username()
-	cfg.Password = password
+	cfg.ServiceToken = serviceToken
 	return cfg, nil
 }

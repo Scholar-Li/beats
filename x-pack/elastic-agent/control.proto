@@ -29,6 +29,19 @@ enum ActionStatus {
   FAILURE = 1;
 }
 
+// pprof endpoint that can be requested.
+enum PprofOption {
+	ALLOCS = 0;
+	BLOCK = 1;
+	CMDLINE = 2;
+	GOROUTINE = 3;
+	HEAP = 4;
+	MUTEX = 5;
+	PROFILE = 6;
+	THREADCREATE = 7;
+	TRACE = 8;
+}
+
 // Empty message.
 message Empty {
 }
@@ -94,6 +107,25 @@ message ApplicationStatus {
   string payload = 5;
 }
 
+// Current metadata for a running process.
+message ProcMeta {
+  string process = 1;
+  string name = 2;
+  string hostname = 3;
+  string id = 4;
+  string ephemeral_id = 5;
+  string version = 6;
+  string build_commit = 7;
+  string build_time = 8;
+  string username = 9;
+  string user_id = 10;
+  string user_gid = 11;
+  string architecture = 12;
+  string route_key = 13;
+  bool elastic_licensed = 14;
+  string error = 15;
+}
+
 // Status is the current status of Elastic Agent.
 message StatusResponse {
   // Overall status of Elastic Agent.
@@ -102,6 +134,50 @@ message StatusResponse {
   string message = 2;
   // Status of each application in Elastic Agent.
   repeated ApplicationStatus applications = 3;
+}
+
+// ProcMetaResponse is the current running version infomation for all processes.
+message ProcMetaResponse {
+  repeated ProcMeta procs = 1;
+}
+
+// PprofRequest is a request for pprof data from and http/pprof endpoint.
+message PprofRequest {
+	// The profiles that are requested
+	repeated PprofOption pprofType = 1;
+	// A string representing a time.Duration to apply to trace, and profile options.
+	string traceDuration = 2;
+	// The application that will be profiled, if empty all applications are profiled.
+	string appName = 3;
+	// The route key to match for profiling, if empty all are profiled.
+	string routeKey = 4;
+}
+
+// PprofResult is the result of a pprof request for a given application/route key.
+message PprofResult {
+	string appName = 1;
+	string routeKey = 2;
+	PprofOption pprofType = 3;
+	bytes result = 4;
+	string error = 5;
+}
+
+// PprofResponse is a wrapper to return all pprof responses.
+message PprofResponse {
+	repeated PprofResult results = 1;
+}
+
+// MetricsResponse is the result of a request for the metrics buffer endpoint for a application/route key
+message MetricsResponse {
+	string appName = 1;
+	string routeKey = 2;
+	bytes result = 3;
+	string error = 4;
+}
+
+// ProcMetricsResponse is a wrapper to return all metrics buffer responses
+message ProcMetricsResponse {
+	repeated MetricsResponse result = 1;
 }
 
 service ElasticAgentControl {
@@ -116,4 +192,13 @@ service ElasticAgentControl {
 
   // Upgrade starts the upgrade process of Elastic Agent.
   rpc Upgrade(UpgradeRequest) returns (UpgradeResponse);
+
+  // Gather all running process metadata.
+  rpc ProcMeta(Empty) returns (ProcMetaResponse);
+
+  // Gather requested pprof data from specified applications.
+  rpc Pprof(PprofRequest) returns (PprofResponse);
+
+  // Gather all running process metrics.
+  rpc ProcMetrics(Empty) returns (ProcMetricsResponse);
 }
